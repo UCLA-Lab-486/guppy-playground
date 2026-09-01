@@ -1,79 +1,204 @@
-import numpy as np
+"""
+QVST (qubitization) Hamiltonian simulation, guppy port of `benchmark_hs.py`.
 
-from guppylang import guppy, comptime
-from guppylang.std.builtins import result, array
-from guppylang.std.quantum import cx, h, measure, qubit, x, z
-from params import J
-from qubitization.util import vec_to_guppy
+Register layout on the full array `qs` (big-endian, ancillas are high bits):
+    qs[0]                          sig   (QSP signal qubit; Qiskit's -1)
+    qs[1 .. CN]                    creg  (control register, creg[0] = MSB)
+    qs[CN + 1]                     anc   (Qiskit's -2)
+    qs[CN + 2 .. CN + 1 + N]       sys   (system qubits)
 
-@guppy
-def 
+With this layout the all-ancilla-zero block occupies global state indices
+0 .. 2^N - 1.
+"""
 
-def qvst_heis_chain(num_qubits: int):
-    params = [J for _ in range(3 * num_qubits - 3)] + [h for _ in range(num_qubits)]
-    control_numbers = comptime(int(np.ceil(np.log2(len(params)))))
+import functools
+import math
+from typing import Any
 
-    norm = sum(params)
+import guppylang
+from guppylang import guppy, qubit
+from guppylang.defs import GuppyFunctionDefinition
+from guppylang.std.builtins import array, comptime
+from guppylang.std.quantum import angle, cx, h, rx, s, sdg
 
-    state = np.zeros((2 ** control_numbers)) + 1j * np.zeros((2 ** control_numbers))
+from qubitization.block_encodings import phase_pi
+from qubitization.util import multicontrol
 
-    for idx in range(len(params)):
-        state[idx] = np.sqrt(params[idx] / norm)
+guppylang.enable_experimental_features()
 
-    qc_prep = vec_to_guppy(control_numbers, state)
+
+# ---------------------------------------------------------------------------
+# Step factories
+#
+# Each factory is its own Python function scope so comptime captures are bound
+# at definition time. Every step acts on the full `array[qubit, total]`.
+# ---------------------------------------------------------------------------
+
+
+def _chain(total, f, g):
+    @guppy
+    def step(qs: array[qubit, comptime(total)]) -> None:
+        f(qs)
+        g(qs)
+
+    return step
+
+
+def _rx_sig(total, theta_rad):
+    # guppy angles are in half-turns: angle(v) rotates by v*pi radians.
+    half_turns = theta_rad / math.pi
 
     @guppy
-    def qc_U(qs: array[qubit, comptime(num_qubits)]) -> None:
-        """
-        Implement qc_U from below in Guppy
-        """
+    def step(qs: array[qubit, comptime(total)]) -> None:
+        rx(qs[0], angle(comptime(half_turns)))
 
-        # ZXZX(qs[0]) implements a global phase of pi
-        x(qs[0])
-        z(qs[0])
-        x(qs[0])
-        z(qs[0])
+    return step
 
 
-        # Claude: use multicontrol here
+def _s_sig(total):
+    @guppy
+    def step(qs: array[qubit, comptime(total)]) -> None:
+        s(qs[0])
 
-        
-    qc_U = QuantumCircuit(num_qubits)
-    qc_U.global_phase = np.pi
-    mczgate = multicontrol_qiskit(qc_U, control_numbers + 1, 1)
+    return step
 
-    control_hamiltonian = QuantumCircuit(num_qubits + control_numbers + 1)
-    cnt = 0
 
-    for idx in range(num_qubits - 1):
-        qc_U = QuantumCircuit(num_qubits)
-        qc_U.z(idx)
-        qc_U.z(idx + 1)
-        control_hamiltonian.compose(multicontrol_qiskit(qc_U, control_numbers + 1, cnt + 2 ** control_numbers),
-                   [idx for idx in range(num_qubits + control_numbers + 1)], inplace=True)
-        cnt += 1
+def _sdg_sig(total):
+    @guppy
+    def step(qs: array[qubit, comptime(total)]) -> None:
+        sdg(qs[0])
 
-    for idx in range(num_qubits - 1):
-        qc_U = QuantumCircuit(num_qubits)
-        qc_U.x(idx)
-        qc_U.x(idx + 1)
-        control_hamiltonian.compose(multicontrol_qiskit(qc_U, control_numbers + 1, cnt + 2 ** control_numbers),
-                   [idx for idx in range(num_qubits + control_numbers + 1)], inplace=True)
-        cnt += 1
+    return step
 
-    for idx in range(num_qubits - 1):
-        qc_U = QuantumCircuit(num_qubits)
-        qc_U.y(idx)
-        qc_U.y(idx + 1)
-        control_hamiltonian.compose(multicontrol_qiskit(qc_U, control_numbers + 1, cnt + 2 ** control_numbers),
-                   [idx for idx in range(num_qubits + control_numbers + 1)], inplace=True)
-        cnt += 1
 
-    for idx in range(num_qubits):
-        qc_U = QuantumCircuit(num_qubits)
-        qc_U.x(idx)
-        control_hamiltonian.compose(multicontrol_qiskit(qc_U, control_numbers + 1, cnt + 2 ** control_numbers),
-                   [idx for idx in range(num_qubits + control_numbers + 1)], inplace=True)
-        cnt += 1
+def _h_anc(total, anc_idx):
+    @guppy
+    def step(qs: array[qubit, comptime(total)]) -> None:
+        h(qs[comptime(anc_idx)])
 
-    return control_numbers, preperation, mczgate, control_hamiltonian
+    return step
+
+
+def _cx_sig_anc(total, anc_idx):
+    @guppy
+    def step(qs: array[qubit, comptime(total)]) -> None:
+        cx(qs[0], qs[comptime(anc_idx)])
+
+    return step
+
+
+def _lift1(total, fn, offset, m):
+    """Apply `fn` (on array[qubit, m]) to qs[offset .. offset + m - 1]."""
+
+    @guppy
+    def step(qs: array[qubit, comptime(total)]) -> None:
+        sub = array(qs.take(comptime(offset) + i) for i in range(comptime(m)))
+        fn(sub)
+        for i in range(comptime(m)):
+            qs.put(sub.take(i), comptime(offset) + i)
+        sub.discard_all_taken()
+
+    return step
+
+
+def _lift_mc(total, mcfn, c0, nc, t0, nt):
+    """Apply `mcfn(controls, targets)` with controls at offset c0, targets at t0."""
+
+    @guppy
+    def step(qs: array[qubit, comptime(total)]) -> None:
+        ctrls = array(qs.take(comptime(c0) + i) for i in range(comptime(nc)))
+        tgts = array(qs.take(comptime(t0) + i) for i in range(comptime(nt)))
+        mcfn(ctrls, tgts)
+        for i in range(comptime(nc)):
+            qs.put(ctrls.take(i), comptime(c0) + i)
+        for i in range(comptime(nt)):
+            qs.put(tgts.take(i), comptime(t0) + i)
+        ctrls.discard_all_taken()
+        tgts.discard_all_taken()
+
+    return step
+
+
+# ---------------------------------------------------------------------------
+# QVST algorithm
+# ---------------------------------------------------------------------------
+
+
+def qvst_algo(
+    num_qubits: int, time_t: float, encoding_builder
+) -> tuple[GuppyFunctionDefinition[..., Any], int, int]:
+    """
+    Build the QVST circuit for exp(-i H t) on `num_qubits` system qubits.
+
+    Returns (circuit, total, control_numbers) where `circuit` is a guppy
+    function on `array[qubit, total]` and total = num_qubits + CN + 2.
+    """
+    if time_t == 0.0070711:
+        Theta_list = [-1.574, 1.5817]
+    elif time_t == 0.0070711 * 2:
+        Theta_list = [2.8729, -0.3212, -2.9309, 0.2659]
+    elif time_t == 0.0070711 * 4:
+        Theta_list = [2.6071, -0.5889, -2.6671, 0.5317]
+    elif time_t == 0.066948:
+        Theta_list = [-0.6741, 2.5806, 0.7772, -2.4675]
+    elif time_t == 0.066948 * 2:
+        Theta_list = [3.0914, -1.1879, 2.0483, 1.9397, -1.2966, -1.3871, 1.8492, 0.0473]
+    elif time_t == 0.066948 * 4:
+        Theta_list = [3.0441, -1.2579, 2.0730, 1.9853, -1.3456, -1.4096, 1.9213, 0.0947]
+    else:
+        raise ValueError("Unkown time_t")
+
+    encoding = encoding_builder(num_qubits)
+    CN = encoding.control_numbers
+    N = num_qubits
+    total = N + CN + 2
+    anc_idx = CN + 1
+    sys_off = CN + 2
+
+    # mcz fires iff sig = 1 and creg = |0...0>: controls are qs[0 .. CN]
+    # (sig then creg), control_state = 2^CN big-endian.
+    mcz = multicontrol(phase_pi(N), n_targets=N, n_controls=CN + 1, control_state=2**CN)
+    mcz_step = _lift_mc(total, mcz, 0, CN + 1, sys_off, N)
+
+    # SELECT: term k fires iff anc = 1 and creg = |k>: controls are
+    # qs[1 .. CN + 1] (creg then anc), control_state = 2k + 1 big-endian.
+    select_steps = []
+    for k, term in enumerate(encoding.terms):
+        mck = multicontrol(term, n_targets=N, n_controls=CN + 1, control_state=2 * k + 1)
+        select_steps.append(_lift_mc(total, mck, 1, CN + 1, sys_off, N))
+
+    prep_step = _lift1(total, encoding.prep, 1, CN)
+    prep_dg_step = _lift1(total, encoding.prep_dg, 1, CN)
+    s_step = _s_sig(total)
+    sdg_step = _sdg_sig(total)
+    h_step = _h_anc(total, anc_idx)
+    cx_step = _cx_sig_anc(total, anc_idx)
+
+    steps = []
+    for idx in range(len(Theta_list)):
+        if idx % 2 == 0:
+            if idx == 0:
+                steps.append(_rx_sig(total, -Theta_list[idx]))
+            else:
+                steps.append(
+                    _rx_sig(total, -Theta_list[idx] + Theta_list[idx - 1] + math.pi)
+                )
+            steps.append(mcz_step)
+            steps.append(s_step)
+            steps.append(h_step)
+            steps.append(prep_step)
+            steps.extend(select_steps)
+            steps.append(cx_step)
+        else:
+            steps.append(_rx_sig(total, Theta_list[idx - 1] - Theta_list[idx] - math.pi))
+            steps.append(sdg_step)
+            steps.append(cx_step)
+            steps.extend(select_steps)
+            steps.append(h_step)
+            steps.append(prep_dg_step)
+            steps.append(mcz_step)
+
+    steps.append(_rx_sig(total, Theta_list[-1] + math.pi))
+
+    circuit = functools.reduce(lambda f, g: _chain(total, f, g), steps)
+    return circuit, total, CN
