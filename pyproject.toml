@@ -3,10 +3,15 @@ name = "guppy-playground"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.14"
-dependencies = [
-    "guppylang>=1.1.1",
-    "hugr-qir>=0.3.0",
-    "numpy>=2.5.3",
-    "scipy>=1.18.1",
+authors = [
+    { name = "Jason Cheng", email = "jasoncheng224@gmail.com" }
 ]
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+guppy-playground = "guppy_playground:main"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"
