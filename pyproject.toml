@@ -11,6 +11,7 @@ dependencies = [
     "guppylang>=1.1.1",
     "hugr-qir>=0.3.0",
     "numpy>=2.5.3",
+    "qiskit>=2.5.2",
     "scipy>=1.18.1",
 ]
 
